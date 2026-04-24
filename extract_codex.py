@@ -6,10 +6,15 @@ Auto-discovers Codex installations on the device
 """
 
 import json
+import sys
 from pathlib import Path
 from datetime import datetime
 import platform
 import os
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 def find_codex_installations():
     """Find all Codex installation directories"""
@@ -61,7 +66,7 @@ def extract_codex_session(session_file):
     session_meta = {}
     tool_results = []
 
-    with open(session_file, 'r') as f:
+    with open(session_file, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
             try:
                 obj = json.loads(line)
@@ -247,7 +252,7 @@ def main():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = output_dir / f'codex_conversations_{timestamp}.jsonl'
 
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         for conv in all_conversations:
             f.write(json.dumps(conv, ensure_ascii=False) + '\n')
 
