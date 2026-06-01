@@ -60,6 +60,41 @@ def find_codex_installations():
 
     return list(set(locations))
 
+
+def classify_codex_session(session_file, installation):
+    """Infer the Codex storage/platform shape from the session path."""
+    session_path = Path(session_file)
+    installation_path = Path(installation)
+    normalized = str(session_path).replace("\\", "/").lower()
+
+    storage_kind = "unknown"
+    platform_variant = "codex_unknown"
+    retrace_surface = "file_path_only"
+
+    if "/sessions/" in normalized and session_path.name.startswith("rollout-"):
+        storage_kind = "rollout_session"
+        platform_variant = "codex_rollout"
+        retrace_surface = "desktop_or_cli_rollout"
+    elif "/projects/" in normalized:
+        storage_kind = "project_session"
+        platform_variant = "codex_project_session"
+        retrace_surface = "desktop_project_or_workspace"
+
+    if installation_path.name.startswith(".codex"):
+        installation_kind = "user_profile_codex_home"
+    elif installation_path.name.startswith("codex"):
+        installation_kind = "app_support_codex_home"
+    else:
+        installation_kind = "unknown"
+
+    return {
+        "coding_platform": "codex",
+        "platform_variant": platform_variant,
+        "codex_storage_kind": storage_kind,
+        "retrace_surface": retrace_surface,
+        "installation_kind": installation_kind,
+    }
+
 def extract_codex_session(session_file):
     """Extract conversation from a Codex rollout file with full context"""
     messages = []
@@ -210,6 +245,7 @@ def main():
             conv = extract_codex_session(session_file)
             if conv:
                 conv['installation'] = str(installation)
+                conv.update(classify_codex_session(session_file, installation))
                 conversations.append(conv)
 
         if conversations:
