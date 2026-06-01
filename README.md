@@ -25,6 +25,14 @@ Extracts from Codex (if installed)
 - **Searches**: `~/.codex`, `~/.codex-local`
 - **Formats**: Rollout JSONL files
 - **Includes**: User/agent messages, tool results, diffs
+- **Downstream metadata**: emits `coding_platform`, `platform_variant`, `codex_storage_kind`, `retrace_surface`, and `installation_kind` for the wiki / OB1 ingest pipeline
+
+If another terminal or machine runs the nightly wiki ingest pipeline, update both repos there so Codex summaries and retrace annotations stay in sync:
+
+```bash
+cd ~/git/wiki && git pull --ff-only origin master
+cd ~/git/ALL-ai-data-extraction && git pull --ff-only origin dev
+```
 
 ### 3. `extract_cursor.py`
 Extracts from Cursor (Chat + Composer + Agent) - ALL VERSIONS
