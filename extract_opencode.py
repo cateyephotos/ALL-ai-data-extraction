@@ -1,545 +1,381 @@
 #!/usr/bin/env python3
 """
-Extract ALL OpenCode conversation data
-Supports: CLI (JSON files) and Desktop (Tauri .dat files)
+extract_opencode.py -- export OpenCode session history to JSONL
 
-Storage locations:
-- CLI: ~/.local/share/opencode/storage/ (Linux/macOS)
-- Desktop: Platform-specific Tauri app data directories
+Reads OpenCode's on-disk session store directly (pure file I/O) and flattens
+each session to one JSON line. This was chosen over shelling out to
+`opencode export <id>` because, although the CLI export is the "stable
+contract", in practice each export call boots a heavy opencode runtime
+(~10-15s) that does not reliably tear down -- batching it across dozens of
+sessions hangs and leaves orphaned `opencode-cli` server processes. Direct
+parsing is fast, deterministic, spawns nothing, and the storage schema below
+was reverse-engineered and verified against opencode v1.1.48 storage on
+2026-05.
 
-Features:
-- Extracts conversations from sessions WITH and WITHOUT metadata files
-- Reconstructs session metadata (directory, title, timestamps) from message content
-- Assembles complete messages from message metadata + parts
-- Handles sessions where session files are missing or corrupted
+Pipeline position:
+  EXTRACTOR. Writes `extracted_data/opencode_conversations_<ts>.jsonl` --
+  same convention as extract_codex.py / extract_augment.py. Downstream
+  wiki/scripts/ingest/ingest_opencode.py reads the latest JSONL.
+
+Storage schema (verified v1.1.48):
+  <storage>/session/<projectID>/ses_*.json
+      {id, slug, version, projectID, directory, parentID?, title,
+       time:{created,updated}, summary:{additions,deletions,files}}
+  <storage>/message/<sessionID>/msg_*.json
+      {id, sessionID, role, time:{created}, summary:{title,diffs},
+       agent?, model:{providerID,modelID}?, tokens?, cost?}
+  <storage>/part/<messageID>/prt_*.json
+      text:      {type:"text", text}
+      reasoning: {type:"reasoning", text}
+      tool:      {type:"tool"|"tool-call", tool|name, callID, state:{input,status,output}}
+      code:      {type:"code", text, language}
+
+Storage discovery (cross-platform):
+  OpenCode (Bun/Node runtime) uses XDG-style data dirs even on Windows, so
+  the canonical store is `~/.local/share/opencode/storage` on all three
+  platforms, with `$XDG_DATA_HOME` and `%APPDATA%/opencode` as fallbacks.
+  The desktop app (ai.opencode.desktop / ai.opencode.app) is a WebView2/Tauri
+  shell over the same opencode server and shares this store -- there is no
+  separate desktop transcript store to scrape.
+
+No-op behavior:
+  If no storage/sessions exist, prints a clear message and exits 0 (clean
+  no-op) so the nightly orchestrator on machines without OpenCode records no
+  false failure.
+
+Output conversation shape (one JSON object per line), mirroring the
+codex/augment convention so the ingester stays consistent:
+  {
+    "messages": [
+      {"role","content","timestamp","model"?,"provider"?,"agent"?,
+       "reasoning"?,"tool_calls"?,"tool_results"?,"msg_title"?,"tokens"?,"cost"?}
+    ],
+    "session_id","title","cwd","directory","project_id","parent_session_id"?,
+    "slug"?,"version","created_at","updated_at","timestamp","source":"opencode",
+    "session_file","installation","coding_platform":"opencode",
+    "platform_variant","opencode_storage_kind","retrace_surface","summary"?
+  }
 """
 
+from __future__ import annotations
+
 import json
-import struct
-from pathlib import Path
-from datetime import datetime
-import platform
 import os
-from collections import defaultdict
-
-def find_opencode_installations():
-    """Find all OpenCode installation directories"""
-    system = platform.system()
-    home = Path.home()
-    
-    locations = []
-    
-    # CLI storage locations (XDG Base Directory)
-    if system == "Darwin":  # macOS
-        cli_dirs = [
-            home / "Library/Application Support/opencode",
-            Path(os.environ.get('XDG_DATA_HOME', home / '.local/share')) / 'opencode'
-        ]
-    elif system == "Linux":
-        cli_dirs = [
-            Path(os.environ.get('XDG_DATA_HOME', home / '.local/share')) / 'opencode'
-        ]
-    elif system == "Windows":
-        cli_dirs = [
-            Path(os.environ.get('APPDATA', home / 'AppData/Roaming')) / 'opencode'
-        ]
-    else:
-        cli_dirs = [home / '.local/share/opencode']
-    
-    for cli_dir in cli_dirs:
-        if cli_dir.exists():
-            locations.append(('cli', cli_dir))
-    
-    # Desktop storage locations (Tauri app data)
-    if system == "Darwin":  # macOS
-        desktop_dirs = [
-            home / "Library/Application Support/ai.opencode.app"
-        ]
-    elif system == "Linux":
-        desktop_dirs = [
-            home / ".local/share/ai.opencode.app"
-        ]
-    elif system == "Windows":
-        desktop_dirs = [
-            Path(os.environ.get('APPDATA', home / 'AppData/Roaming')) / 'ai.opencode.app'
-        ]
-    else:
-        desktop_dirs = []
-    
-    for desktop_dir in desktop_dirs:
-        if desktop_dir.exists():
-            locations.append(('desktop', desktop_dir))
-    
-    return locations
-
-def read_tauri_store(dat_file):
-    """
-    Parse Tauri store .dat files
-    Format: Simple key-value pairs with length prefixes
-    """
-    try:
-        with open(dat_file, 'rb') as f:
-            data = f.read()
-        
-        store = {}
-        offset = 0
-        
-        while offset < len(data):
-            # Try to read key length (4 bytes, little-endian)
-            if offset + 4 > len(data):
-                break
-            
-            key_len = struct.unpack('<I', data[offset:offset+4])[0]
-            offset += 4
-            
-            # Sanity check
-            if key_len > 10000 or offset + key_len > len(data):
-                break
-            
-            # Read key
-            key = data[offset:offset+key_len].decode('utf-8', errors='ignore')
-            offset += key_len
-            
-            # Read value length
-            if offset + 4 > len(data):
-                break
-            
-            value_len = struct.unpack('<I', data[offset:offset+4])[0]
-            offset += 4
-            
-            # Sanity check
-            if value_len > 1000000 or offset + value_len > len(data):
-                break
-            
-            # Read value
-            try:
-                value_bytes = data[offset:offset+value_len]
-                value = json.loads(value_bytes.decode('utf-8'))
-                store[key] = value
-            except:
-                pass
-            
-            offset += value_len
-        
-        return store
-    
-    except Exception as e:
-        print(f"Error reading Tauri store {dat_file}: {e}")
-        return {}
-
-def extract_directory_from_content(text):
-    """
-    Try to extract a directory path from text content (e.g., tool commands).
-    Looks for common patterns like 'cd /path/to/dir' or paths in commands.
-    """
-    if not text:
-        return None
-    
-    import re
-    
-    # Pattern 1: cd command followed by path
-    cd_pattern = r'cd\s+(["\']?)([^\s\'"]+)\1'
-    matches = re.findall(cd_pattern, text)
-    for match in matches:
-        path = match[1] if isinstance(match, tuple) else match
-        if path and (path.startswith('/') or path.startswith('~') or path[1:].startswith(':')):
-            return path
-    
-    # Pattern 2: Common working directory indicators
-    cwd_pattern = r'(?:working\s+)?directory[:\s]+(["\']?)([^\s\'"]+)\1'
-    matches = re.findall(cwd_pattern, text)
-    for match in matches:
-        path = match[1] if isinstance(match, tuple) else match
-        if path and (path.startswith('/') or path.startswith('~') or path[1:].startswith(':')):
-            return path
-    
-    # Pattern 3: Extract absolute paths (Unix-style)
-    abs_path_pattern = r'(?:^|\s|/)(/[^/\s\'"]{2,})'
-    matches = re.findall(abs_path_pattern, text)
-    for path in matches:
-        if path and len(path) > 3 and not path.endswith('.') and not path.endswith('..'):
-            return path
-    
-    return None
+import platform
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 
-def extract_project_id_from_content(text):
-    """
-    Try to extract a project ID from text content.
-    Often appears in tool commands or git operations.
-    """
-    if not text:
-        return None
-    
-    import re
-    
-    # Pattern: project IDs in commands
-    project_pattern = r'(?:project[-_]?id|project)[=:\s]+([a-zA-Z0-9_-]+)'
-    match = re.search(project_pattern, text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    return None
-
-
-def extract_cli_conversations(storage_dir):
-    """
-    Extract conversations from CLI JSON storage.
-    
-    Handles sessions both WITH and WITHOUT session metadata files.
-    For sessions without metadata, reconstructs session info from messages/parts.
-    """
-    conversations = []
-    
-    message_dir = storage_dir / 'storage' / 'message'
-    part_dir = storage_dir / 'storage' / 'part'
-    
-    if not message_dir.exists():
-        print(f"  Message directory not found: {message_dir}")
-        return conversations
-    
-    # Find all session directories (each is a directory named ses_xxx)
-    session_dirs = [d for d in message_dir.iterdir() if d.is_dir() and d.name.startswith('ses_')]
-    
-    print(f"  Found {len(session_dirs)} session directories")
-    
-    processed_sessions = set()
-    
-    for session_dir_path in session_dirs:
+# --- UTF-8 stdio guard (Windows scheduled-task cp1252 crash prevention) ----
+def _ensure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
         try:
-            session_id = session_dir_path.name
-            
-            # Skip if already processed (deduplication)
-            if session_id in processed_sessions:
-                continue
-            processed_sessions.add(session_id)
-            
-            # Try to load session metadata if available
-            session_data = None
-            session_file = storage_dir / 'storage' / 'session' / 'global' / f'{session_id}.json'
-            
-            if session_file.exists():
-                with open(session_file) as f:
-                    session_data = json.load(f)
-            
-            # Collect all messages for this session
-            message_files = sorted(session_dir_path.glob('msg_*.json'))
-            
-            if not message_files:
-                continue
-            
-            messages = []
-            all_content = []  # For reconstructing metadata
-            first_message_time = None
-            last_message_time = None
-            
-            for msg_file in message_files:
-                try:
-                    with open(msg_file) as f:
-                        msg_data = json.load(f)
-                    
-                    message_id = msg_data.get('id')
-                    role = msg_data.get('role', 'assistant')
-                    msg_time = msg_data.get('time', {}).get('created')
-                    
-                    # Track timestamps
-                    if msg_time:
-                        if not first_message_time or msg_time < first_message_time:
-                            first_message_time = msg_time
-                        if not last_message_time or msg_time > last_message_time:
-                            last_message_time = msg_time
-                    
-                    # Build the message
-                    message = {
-                        'role': role,
-                        'content': '',
-                        'timestamp': msg_time
-                    }
-                    
-                    # Add metadata
-                    if 'modelID' in msg_data:
-                        message['model'] = msg_data['modelID']
-                    if 'providerID' in msg_data:
-                        message['provider'] = msg_data['providerID']
-                    if 'agent' in msg_data:
-                        message['agent'] = msg_data['agent']
-                    if 'mode' in msg_data:
-                        message['mode'] = msg_data['mode']
-                    
-                    # Add token usage
-                    if 'tokens' in msg_data:
-                        message['tokens'] = msg_data['tokens']
-                    if 'cost' in msg_data:
-                        message['cost'] = msg_data['cost']
-                    
-                    # Find all parts for this message
-                    message_part_dir = part_dir / message_id
-                    
-                    if message_part_dir.exists():
-                        part_files = sorted(message_part_dir.glob('prt_*.json'))
-                        content_parts = []
-                        tool_calls = []
-                        tool_results = []
-                        reasoning_parts = []
-                        
-                        for part_file in part_files:
-                            try:
-                                with open(part_file) as f:
-                                    part_data = json.load(f)
-                                
-                                part_type = part_data.get('type')
-                                part_text = part_data.get('text', '')
-                                
-                                # Collect content for metadata reconstruction
-                                if part_text:
-                                    all_content.append(part_text)
-                                
-                                if part_type == 'text':
-                                    content_parts.append(part_text)
-                                elif part_type == 'tool' or part_type == 'tool-call':
-                                    # OpenCode uses 'tool' type with state containing input/output
-                                    state = part_data.get('state', {})
-                                    tool_name = part_data.get('tool', part_data.get('name'))
-                                    
-                                    tool_call = {
-                                        'id': part_data.get('callID', part_data.get('id')),
-                                        'name': tool_name,
-                                        'input': state.get('input', part_data.get('input'))
-                                    }
-                                    
-                                    # If completed, also add to tool_results
-                                    if state.get('status') == 'completed' and 'output' in state:
-                                        tool_results.append({
-                                            'tool_call_id': part_data.get('callID'),
-                                            'tool': tool_name,
-                                            'output': state['output']
-                                        })
-                                    
-                                    tool_calls.append(tool_call)
-                                elif part_type == 'tool-result':
-                                    tool_results.append({
-                                        'tool_call_id': part_data.get('toolCallID'),
-                                        'output': part_data.get('output')
-                                    })
-                                elif part_type == 'code':
-                                    # Code blocks
-                                    code_text = part_data.get('text', '')
-                                    language = part_data.get('language', '')
-                                    content_parts.append(f"```{language}\n{code_text}\n```")
-                                elif part_type == 'reasoning':
-                                    # Reasoning/thinking content
-                                    reasoning_text = part_data.get('text', '')
-                                    if reasoning_text:
-                                        reasoning_parts.append(reasoning_text)
-                                
-                            except Exception as e:
-                                print(f"    Error reading part {part_file}: {e}")
-                                continue
-                        
-                        message['content'] = '\n'.join(content_parts)
-                        
-                        if tool_calls:
-                            message['tool_calls'] = tool_calls
-                        if tool_results:
-                            message['tool_results'] = tool_results
-                        if reasoning_parts:
-                            message['reasoning'] = '\n'.join(reasoning_parts)
-                    
-                    messages.append(message)
-                
-                except Exception as e:
-                    print(f"    Error reading message {msg_file}: {e}")
-                    continue
-            
-            if not messages:
-                continue
-            
-            # Build conversation - use session data if available, otherwise reconstruct
-            combined_content = '\n'.join(all_content)
-            
-            conversation = {
-                'messages': messages,
-                'source': 'opencode-cli',
-                'session_id': session_id,
-            }
-            
-            if session_data:
-                # Use metadata from session file
-                conversation['title'] = session_data.get('title')
-                conversation['created_at'] = session_data.get('time', {}).get('created')
-                conversation['updated_at'] = session_data.get('time', {}).get('updated')
-                conversation['project_id'] = session_data.get('projectID')
-                conversation['directory'] = session_data.get('directory')
-                conversation['version'] = session_data.get('version')
-                
-                # Add summary stats if available
-                if 'summary' in session_data:
-                    conversation['summary'] = session_data['summary']
-                
-                # Add parent session if it's a child session
-                if 'parentID' in session_data:
-                    conversation['parent_session_id'] = session_data['parentID']
-            else:
-                # RECONSTRUCT metadata from messages/parts
-                conversation['created_at'] = first_message_time
-                conversation['updated_at'] = last_message_time
-                
-                # Try to extract directory from content
-                conversation['directory'] = extract_directory_from_content(combined_content)
-                
-                # Try to extract project ID from content
-                conversation['project_id'] = extract_project_id_from_content(combined_content)
-                
-                # Generate a title from first user message
-                for msg in messages:
-                    if msg.get('role') == 'user' and msg.get('content'):
-                        # Take first 100 chars of first user message as title
-                        title = msg['content'][:100].strip()
-                        if len(msg['content']) > 100:
-                            title += '...'
-                        conversation['title'] = title
-                        break
-                
-                # Set default version
-                conversation['version'] = 'unknown'
-            
-            conversations.append(conversation)
-        
-        except Exception as e:
-            print(f"  Error processing session {session_dir_path}: {e}")
-            continue
-    
-    return conversations
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover
+            pass
 
-def extract_desktop_conversations(desktop_dir):
-    """Extract conversations from Desktop Tauri store files"""
-    conversations = []
-    
-    # Look for .dat files
-    dat_files = list(desktop_dir.rglob('*.dat'))
-    
-    if not dat_files:
-        return conversations
-    
-    print(f"  Found {len(dat_files)} .dat store files")
-    
-    for dat_file in dat_files:
-        store = read_tauri_store(dat_file)
-        
-        if not store:
-            continue
-        
-        # Look for session/conversation data in the store
-        # Keys might be like "session:ses_xxxxx" or similar
-        for key, value in store.items():
-            if not isinstance(value, dict):
-                continue
-            
-            # Check if this looks like a conversation/session
-            if 'messages' in value or 'history' in value:
-                try:
-                    messages = value.get('messages', value.get('history', []))
-                    
-                    if not messages:
-                        continue
-                    
-                    conversation = {
-                        'messages': messages,
-                        'source': 'opencode-desktop',
-                        'store_key': key,
-                        'store_file': str(dat_file.name)
-                    }
-                    
-                    # Add any additional metadata
-                    for meta_key in ['session_id', 'title', 'created_at', 'workspace']:
-                        if meta_key in value:
-                            conversation[meta_key] = value[meta_key]
-                    
-                    conversations.append(conversation)
-                
-                except Exception as e:
-                    continue
-    
-    return conversations
 
-def main():
-    print("="*80)
-    print("OPENCODE EXTRACTION")
-    print("="*80)
+_ensure_utf8_stdio()
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+def find_storage_dirs() -> list[Path]:
+    """Return existing OpenCode storage directories. XDG-style on all OSes."""
+    home = Path.home()
+    candidate_roots = [
+        Path(os.environ["XDG_DATA_HOME"]) / "opencode"
+        if os.environ.get("XDG_DATA_HOME")
+        else home / ".local/share/opencode",
+        home / ".local/share/opencode",
+    ]
+    if platform.system() == "Windows":
+        candidate_roots.append(
+            Path(os.environ.get("APPDATA", home / "AppData/Roaming")) / "opencode"
+        )
+    if platform.system() == "Darwin":
+        candidate_roots.append(home / "Library/Application Support/opencode")
+
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for root in candidate_roots:
+        storage = root / "storage"
+        if storage.exists() and storage not in seen:
+            seen.add(storage)
+            out.append(storage)
+    return out
+
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def index_sessions(storage: Path) -> dict[str, tuple[dict, Path]]:
+    """Map session_id -> (session_metadata, session_file_path) from
+    storage/session/<projectID>/ses_*.json. Filenames carry the id."""
+    out: dict[str, tuple[dict, Path]] = {}
+    session_root = storage / "session"
+    if not session_root.exists():
+        return out
+    for path in session_root.rglob("ses_*.json"):
+        sid = path.stem
+        meta = _load_json(path)
+        if isinstance(meta, dict):
+            out.setdefault(sid, (meta, path))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Message + part assembly
+# ---------------------------------------------------------------------------
+
+
+def _dget(obj: object, key: str, default=None):
+    """Safe nested .get -- returns default if obj isn't a dict. OpenCode
+    occasionally stores a bare bool where a {} is expected (e.g. message
+    `summary`), so guard every nested access."""
+    return obj.get(key, default) if isinstance(obj, dict) else default
+
+
+def _ms_to_iso(ms: object) -> str | None:
+    if not isinstance(ms, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _flatten_parts(part_dir: Path) -> dict:
+    """Collapse a message's parts into content/reasoning/tool fields."""
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict] = []
+    tool_results: list[dict] = []
+
+    if not part_dir.exists():
+        return {"content": ""}
+
+    for part_file in sorted(part_dir.glob("prt_*.json")):
+        part = _load_json(part_file)
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        text = part.get("text", "") or ""
+
+        if ptype == "text":
+            if text:
+                content_parts.append(text)
+        elif ptype == "reasoning":
+            if text:
+                reasoning_parts.append(text)
+        elif ptype in ("tool", "tool-call"):
+            state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+            tool_name = part.get("tool") or part.get("name")
+            tool_calls.append({
+                "id": part.get("callID") or part.get("id"),
+                "name": tool_name,
+                "input": state.get("input", part.get("input")),
+            })
+            if state.get("status") == "completed" and "output" in state:
+                tool_results.append({
+                    "tool_call_id": part.get("callID"),
+                    "tool": tool_name,
+                    "output": state.get("output"),
+                })
+        elif ptype == "tool-result":
+            tool_results.append({
+                "tool_call_id": part.get("toolCallID"),
+                "output": part.get("output"),
+            })
+        elif ptype == "code":
+            lang = part.get("language", "")
+            if text:
+                content_parts.append(f"```{lang}\n{text}\n```")
+
+    out: dict = {"content": "\n".join(content_parts)}
+    if reasoning_parts:
+        out["reasoning"] = "\n".join(reasoning_parts)
+    if tool_calls:
+        out["tool_calls"] = tool_calls
+    if tool_results:
+        out["tool_results"] = tool_results
+    return out
+
+
+def build_conversation(
+    session_id: str,
+    storage: Path,
+    session_index: dict[str, tuple[dict, Path]],
+) -> dict | None:
+    """Assemble one conversation from message + part files for a session."""
+    msg_dir = storage / "message" / session_id
+    if not msg_dir.exists():
+        return None
+
+    part_root = storage / "part"
+    messages: list[dict] = []
+    first_ts = None
+    last_ts = None
+
+    for msg_file in sorted(msg_dir.glob("msg_*.json")):
+        minfo = _load_json(msg_file)
+        if not isinstance(minfo, dict):
+            continue
+        msg_id = minfo.get("id") or msg_file.stem
+        created = _dget(minfo.get("time"), "created")
+        if isinstance(created, (int, float)):
+            first_ts = created if first_ts is None else min(first_ts, created)
+            last_ts = created if last_ts is None else max(last_ts, created)
+
+        flat = _flatten_parts(part_root / msg_id)
+        msg: dict = {
+            "role": minfo.get("role", "assistant"),
+            "content": flat.get("content", ""),
+            "timestamp": created,
+        }
+        model = minfo.get("model")
+        if isinstance(model, dict):
+            if model.get("modelID"):
+                msg["model"] = model["modelID"]
+            if model.get("providerID"):
+                msg["provider"] = model["providerID"]
+        if minfo.get("agent"):
+            msg["agent"] = minfo["agent"]
+        msg_title = _dget(minfo.get("summary"), "title")
+        if msg_title:
+            msg["msg_title"] = msg_title
+        if minfo.get("tokens"):
+            msg["tokens"] = minfo["tokens"]
+        if minfo.get("cost") is not None:
+            msg["cost"] = minfo["cost"]
+        for key in ("reasoning", "tool_calls", "tool_results"):
+            if key in flat:
+                msg[key] = flat[key]
+
+        if msg["content"] or "tool_calls" in msg or "reasoning" in msg:
+            messages.append(msg)
+
+    if not messages:
+        return None
+
+    meta, session_file = session_index.get(session_id, ({}, msg_dir))
+    time_obj = meta.get("time", {}) if isinstance(meta.get("time"), dict) else {}
+    created = time_obj.get("created", first_ts)
+    updated = time_obj.get("updated", last_ts)
+    directory = meta.get("directory")
+
+    conv: dict = {
+        "messages": messages,
+        "session_id": session_id,
+        "title": meta.get("title"),
+        "cwd": directory,
+        "directory": directory,
+        "project_id": meta.get("projectID"),
+        "slug": meta.get("slug"),
+        "version": meta.get("version") or "unknown",
+        "created_at": created,
+        "updated_at": updated,
+        "timestamp": _ms_to_iso(created) or "unknown",
+        "source": "opencode",
+        "session_file": str(session_file),
+        "installation": f"opencode {meta.get('version') or 'unknown'}".strip(),
+        "coding_platform": "opencode",
+        "platform_variant": "opencode_cli",
+        "opencode_storage_kind": "storage_files",
+        "retrace_surface": "opencode_export",
+    }
+    if meta.get("parentID"):
+        conv["parent_session_id"] = meta["parentID"]
+    if isinstance(meta.get("summary"), dict):
+        conv["summary"] = meta["summary"]
+    return conv
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    print("=" * 80)
+    print("OPENCODE EXTRACTION (direct storage parse)")
+    print("=" * 80)
+
+    storage_dirs = find_storage_dirs()
+    if not storage_dirs:
+        print("No opencode storage directory found -- nothing to extract (clean no-op).")
+        return 0
+
+    conversations: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for storage in storage_dirs:
+        print(f"storage: {storage}")
+        session_index = index_sessions(storage)
+        # Enumerate sessions by message dir so we capture sessions even if the
+        # session metadata file is missing (reconstruct from messages).
+        msg_root = storage / "message"
+        session_ids = (
+            sorted(d.name for d in msg_root.iterdir() if d.is_dir() and d.name.startswith("ses_"))
+            if msg_root.exists() else []
+        )
+        print(f"  sessions with messages: {len(session_ids)} "
+              f"(metadata files: {len(session_index)})")
+
+        for i, sid in enumerate(session_ids, 1):
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+            conv = build_conversation(sid, storage, session_index)
+            if conv:
+                conversations.append(conv)
+            if i <= 3 or i % 10 == 0 or i == len(session_ids):
+                n = len(conv["messages"]) if conv else 0
+                title = (conv.get("title") if conv else None) or "(no metadata)"
+                print(f"  [{i}/{len(session_ids)}] {sid} -> {n} msg(s)  {str(title)[:60]}")
+
+    if not conversations:
+        print("Exported 0 conversations (sessions empty).")
+        return 0
+
+    total_messages = sum(len(c["messages"]) for c in conversations)
+    with_tools = sum(1 for c in conversations
+                     if any("tool_calls" in m for m in c["messages"]))
+    with_parent = sum(1 for c in conversations if c.get("parent_session_id"))
+    with_meta = sum(1 for c in conversations if c.get("title"))
+
     print()
-    
-    installations = find_opencode_installations()
-    
-    if not installations:
-        print("❌ No OpenCode installations found!")
-        print()
-        print("Searched locations:")
-        print("  CLI: ~/.local/share/opencode (Linux)")
-        print("       ~/Library/Application Support/opencode (macOS)")
-        print("  Desktop: ~/.local/share/ai.opencode.app (Linux)")
-        print("           ~/Library/Application Support/ai.opencode.app (macOS)")
-        return
-    
-    print(f"✅ Found {len(installations)} installation(s)")
-    print()
-    
-    all_conversations = []
-    
-    for install_type, install_dir in installations:
-        print(f"Processing {install_type} installation: {install_dir}")
-        
-        if install_type == 'cli':
-            conversations = extract_cli_conversations(install_dir)
-        else:  # desktop
-            conversations = extract_desktop_conversations(install_dir)
-        
-        print(f"  Extracted {len(conversations)} conversations")
-        all_conversations.extend(conversations)
-        print()
-    
-    if not all_conversations:
-        print("❌ No conversation data found!")
-        return
-    
-    print(f"✅ Total conversations extracted: {len(all_conversations)}")
-    
-    # Calculate detailed statistics
-    total_messages = sum(len(c['messages']) for c in all_conversations)
-    with_tools = sum(1 for c in all_conversations 
-                     if any('tool_calls' in m or 'tool_results' in m 
-                           for m in c['messages']))
-    with_models = sum(1 for c in all_conversations
-                     if any('model' in m for m in c['messages']))
-    with_reasoning = sum(1 for c in all_conversations
-                        if any('reasoning' in m for m in c['messages']))
-    
-    # Count sessions with and without metadata
-    with_session_file = sum(1 for c in all_conversations if c.get('directory'))
-    without_session_file = len(all_conversations) - with_session_file
-    
-    print(f"Total messages: {total_messages}")
-    print(f"With tool use: {with_tools}")
-    print(f"With model info: {with_models}")
-    print(f"With reasoning: {with_reasoning}")
-    print(f"Full metadata (has session file): {with_session_file}")
-    print(f"Reconstructed (no session file): {without_session_file}")
-    print()
-    
-    # Save
-    output_dir = Path('extracted_data')
+    print(f"Total conversations: {len(conversations)}")
+    print(f"Total messages:      {total_messages}")
+    print(f"With tool use:       {with_tools}")
+    print(f"Subagent/child:      {with_parent}")
+    print(f"With session title:  {with_meta}")
+
+    output_dir = Path("extracted_data")
     output_dir.mkdir(exist_ok=True)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = output_dir / f'opencode_conversations_{timestamp}.jsonl'
-    
-    with open(output_file, 'w') as f:
-        for conv in all_conversations:
-            f.write(json.dumps(conv, ensure_ascii=False) + '\n')
-    
-    file_size = output_file.stat().st_size / 1024
-    print(f"✅ Saved to: {output_file}")
-    print(f"   Size: {file_size:.2f} KB")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"opencode_conversations_{timestamp}.jsonl"
+    with open(output_file, "w", encoding="utf-8") as f:
+        for conv in conversations:
+            f.write(json.dumps(conv, ensure_ascii=False) + "\n")
 
-if __name__ == '__main__':
-    main()
-	
+    size_kb = output_file.stat().st_size / 1024
+    print(f"Saved: {output_file} ({size_kb:.1f} KB, JSONL one-conversation-per-line)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
