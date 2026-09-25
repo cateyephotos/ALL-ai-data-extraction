@@ -95,6 +95,27 @@ def classify_codex_session(session_file, installation):
         "installation_kind": installation_kind,
     }
 
+# Codex rollouts rewritten by the 2026-09-08 rollout migration (and all newer ones)
+# no longer emit event_msg/user_message|agent_message; the chat turns arrive as
+# event_msg/item_completed with item.type UserMessage/AgentMessage instead.
+ITEM_COMPLETED_MESSAGE_TYPES = {
+    'UserMessage': 'user_message',
+    'AgentMessage': 'agent_message',
+}
+
+
+def content_text(content):
+    """Join the text parts of a Codex content list; pass plain strings through."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(
+            part['text'] for part in content
+            if isinstance(part, dict) and isinstance(part.get('text'), str)
+        )
+    return ''
+
+
 def extract_codex_session(session_file):
     """Extract conversation from a Codex rollout file with full context"""
     messages = []
@@ -108,11 +129,19 @@ def extract_codex_session(session_file):
                 event_type = obj.get('type')
 
                 if event_type == 'session_meta':
-                    session_meta = obj.get('payload', {})
+                    # Forked/sub-agent rollouts embed the parent's session_meta
+                    # after their own; keep the first (this file's) one.
+                    if not session_meta:
+                        session_meta = obj.get('payload', {})
 
                 elif event_type == 'event_msg':
                     payload = obj.get('payload', {})
                     payload_type = payload.get('type')
+
+                    if payload_type == 'item_completed':
+                        item = payload.get('item') or {}
+                        payload_type = ITEM_COMPLETED_MESSAGE_TYPES.get(item.get('type'))
+                        payload = {'message': content_text(item.get('content'))}
 
                     if payload_type == 'user_message':
                         message_text = payload.get('message', '').strip()
